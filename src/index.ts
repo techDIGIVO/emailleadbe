@@ -35,6 +35,79 @@ try {
   console.error("Error loading hubspot.json:", e)
 }
 
+let hubspotCursor: string | undefined = undefined;
+let isFetchingHubspot = false;
+
+async function ensureHubspotContacts(requiredCount: number) {
+  if (hubspotContacts.length >= requiredCount) return;
+  if (isFetchingHubspot) {
+    while (isFetchingHubspot && hubspotContacts.length < requiredCount) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (hubspotContacts.length >= requiredCount) return;
+  }
+  
+  isFetchingHubspot = true;
+  try {
+    const ht = process.env.HUBSPOT_TOKEN;
+    if (!ht) {
+      console.warn("HUBSPOT_TOKEN is not set. Cannot fetch more contacts.");
+      return;
+    }
+
+    const existingIds = new Set(hubspotContacts.map(c => c.id));
+    let i = 0;
+
+    while (hubspotContacts.length < requiredCount) {
+      const url = new URL("https://api.hubapi.com/crm/v3/objects/contacts");
+      url.searchParams.set("limit", "100");
+
+      if (hubspotCursor) {
+        url.searchParams.set("after", hubspotCursor);
+      }
+
+      console.log(`Fetching more HubSpot contacts (required: ${requiredCount}, current: ${hubspotContacts.length})...`);
+      const res = await fetch(url.toString(), {
+        headers: {
+          Authorization: `Bearer ${ht}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        console.error(`HubSpot API error: ${res.status} ${res.statusText}`);
+        break;
+      }
+
+      const data = await res.json();
+      if (!data.results || data.results.length === 0) break;
+
+      let added = 0;
+      for (const contact of data.results) {
+        if (!existingIds.has(contact.id)) {
+          hubspotContacts.push(contact);
+          existingIds.add(contact.id);
+          added++;
+        }
+      }
+      
+      console.log(`Fetched ${data.results.length} contacts, added ${added} novel ones. Total: ${hubspotContacts.length}`);
+
+      if (data.paging?.next?.after) {
+        hubspotCursor = data.paging.next.after;
+        if (i > 500) break;
+        i++;
+      } else {
+        break;
+      }
+    }
+  } catch (err) {
+    console.error("Error ensuring HubSpot contacts:", err);
+  } finally {
+    isFetchingHubspot = false;
+  }
+}
+
 app.get('/', (c) => {
   return c.text('Email Lead Generation API is running!')
 })
@@ -45,7 +118,7 @@ app.get('/api/leads', (c) => {
 })
 
 // Endpoint to get hubspot contacts with pagination
-app.get('/api/hubspot/contacts', (c) => {
+app.get('/api/hubspot/contacts', async (c) => {
   const limitStr = c.req.query('limit') || '50'
   const offsetStr = c.req.query('offset') || '0'
   
@@ -55,6 +128,8 @@ app.get('/api/hubspot/contacts', (c) => {
   if (isNaN(limit) || isNaN(offset)) {
     return c.json({ error: 'invalid limit or offset parameters' }, 400)
   }
+  
+  await ensureHubspotContacts(offset + limit)
   
   const paginatedContacts = hubspotContacts.slice(offset, offset + limit)
   return c.json({
@@ -66,7 +141,7 @@ app.get('/api/hubspot/contacts', (c) => {
 })
 
 // Endpoint to get a selected number of hubspot contacts (e.g. 50, 100, 500, 1000)
-app.get('/api/hubspot/contacts/:count', (c) => {
+app.get('/api/hubspot/contacts/:count', async (c) => {
   const countStr = c.req.param('count')
   const count = parseInt(countStr, 10)
   
@@ -76,6 +151,8 @@ app.get('/api/hubspot/contacts/:count', (c) => {
   
   const offsetStr = c.req.query('offset') || '0'
   const offset = parseInt(offsetStr, 10) || 0
+  
+  await ensureHubspotContacts(offset + count)
   
   const paginatedContacts = hubspotContacts.slice(offset, offset + count)
   return c.json({
