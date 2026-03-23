@@ -66,6 +66,8 @@ async function ensureHubspotContacts(requiredCount: number) {
       url.searchParams.append("properties", "email");
       url.searchParams.append("properties", "company");
       url.searchParams.append("properties", "jobtitle");
+      url.searchParams.append("properties", "hs_email_last_open_date");
+      url.searchParams.append("properties", "hs_email_last_click_date");
 
       if (hubspotCursor) {
         url.searchParams.set("after", hubspotCursor);
@@ -227,6 +229,13 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
     const company = body.company || c.req.query('company');
     const role = body.role || c.req.query('role');
     const region = body.region || c.req.query('region');
+    const interactedParam = body.interacted ?? c.req.query('interacted');
+    let interacted: boolean | undefined = undefined;
+    if (interactedParam === true || interactedParam === 'true') {
+      interacted = true;
+    } else if (interactedParam === false || interactedParam === 'false') {
+      interacted = false;
+    }
     const limit = parseInt(body.limit || c.req.query('limit') || '50', 10);
     const after = body.after || c.req.query('after');
 
@@ -242,6 +251,11 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
     }
     if (role) {
       filters.push({ propertyName: 'jobtitle', operator: 'CONTAINS_TOKEN', value: role });
+    }
+    if (interacted === true) {
+      filters.push({ propertyName: 'hs_email_last_open_date', operator: 'HAS_PROPERTY' });
+    } else if (interacted === false) {
+      filters.push({ propertyName: 'hs_email_last_open_date', operator: 'NOT_HAS_PROPERTY' });
     }
     
     let filterGroups: any[] = [];
@@ -261,7 +275,7 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
     const searchBody: any = {
       limit: limit,
       // Request standard properties to return
-      properties: ["firstname", "lastname", "email", "company", "jobtitle", "state", "city", "country"]
+      properties: ["firstname", "lastname", "email", "company", "jobtitle", "state", "city", "country", "hs_email_last_open_date", "hs_email_last_click_date"]
     };
 
     if (filterGroups.length > 0) {
@@ -330,7 +344,7 @@ app.post('/api/generate-email', async (c) => {
         
         try {
           const idProp = isEmail ? '&idProperty=email' : '';
-          const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle${idProp}`, {
+          const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle,hs_email_last_open_date,hs_email_last_click_date${idProp}`, {
             headers: { Authorization: `Bearer ${ht}` }
           });
           if (res.ok) {
@@ -344,7 +358,7 @@ app.post('/api/generate-email', async (c) => {
             const searchBody = {
               query: identifier, // Generic search across text/name fields
               limit: 1,
-              properties: ["firstname", "lastname", "email", "company", "jobtitle"]
+              properties: ["firstname", "lastname", "email", "company", "jobtitle", "hs_email_last_open_date", "hs_email_last_click_date"]
             };
             const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
               method: "POST",

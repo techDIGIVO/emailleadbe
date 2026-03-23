@@ -198,6 +198,7 @@
 | `company` | `string` | Filter by company name |
 | `role` | `string` | Filter by job title |
 | `region` | `string` | Filter by state, city, or country |
+| `interacted` | `boolean` | If `true`, returns contacts that have opened an email. If `false`, returns contacts that have NOT opened an email. |
 | `limit` | `number` | Number of results to return (default: `50`) |
 | `after` | `string` | Pagination cursor returned from a previous search |
 
@@ -206,11 +207,12 @@
 {
   "company": "Coresight",
   "role": "Manager",
-  "region": "California"
+  "region": "California",
+  "interacted": true
 }
 ```
 *Alternatively, you can provide the parameters in the URL:*
-`/api/hubspot/search?company=Coresight&role=Manager&region=California`
+`/api/hubspot/search?company=Coresight&role=Manager&region=California&interacted=true`
 
 #### Success Response
 ```json
@@ -226,7 +228,8 @@
         "jobtitle": "Marketing Manager",
         "state": "California",
         "city": "Los Angeles",
-        "country": "United States"
+        "country": "United States",
+        "hs_email_last_open_date": "2024-05-12T08:32:00Z"
       }
     }
   ],
