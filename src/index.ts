@@ -61,6 +61,11 @@ async function ensureHubspotContacts(requiredCount: number) {
     while (hubspotContacts.length < requiredCount) {
       const url = new URL("https://api.hubapi.com/crm/v3/objects/contacts");
       url.searchParams.set("limit", "100");
+      url.searchParams.append("properties", "firstname");
+      url.searchParams.append("properties", "lastname");
+      url.searchParams.append("properties", "email");
+      url.searchParams.append("properties", "company");
+      url.searchParams.append("properties", "jobtitle");
 
       if (hubspotCursor) {
         url.searchParams.set("after", hubspotCursor);
@@ -293,7 +298,7 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
 app.post('/api/generate-email', async (c) => {
   try {
     const body = await c.req.json()
-    const { identifier, context } = body
+    const { identifier, context, company } = body
     
     // Find the lead in regular leads first
     let lead = leads.find(l => 
@@ -303,22 +308,73 @@ app.post('/api/generate-email', async (c) => {
       l.name === identifier
     )
     
+    if (lead && company) {
+      // Override or populate with the explicitly provided company
+      lead.company = company;
+    }
+    
     let isHubspotContact = false;
 
     // If not found in leads, search in HubSpot contacts
     if (!lead) {
-      const hsContact = hubspotContacts.find(c => 
+      let hsContact = hubspotContacts.find(c => 
         c.properties?.email === identifier ||
         c.id === identifier ||
         `${c.properties?.firstname || ''} ${c.properties?.lastname || ''}`.trim() === identifier
       )
+      
+      // If contact was not found locally (maybe found via HubSpot search endpoint instead), fetch it from HubSpot API
+      if (!hsContact && process.env.HUBSPOT_TOKEN) {
+        const ht = process.env.HUBSPOT_TOKEN;
+        const isEmail = identifier.includes('@');
+        
+        try {
+          const idProp = isEmail ? '&idProperty=email' : '';
+          const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle${idProp}`, {
+            headers: { Authorization: `Bearer ${ht}` }
+          });
+          if (res.ok) {
+            hsContact = await res.json();
+          }
+        } catch(e) { console.error("Error fetching contact by ID/Email", e); }
+        
+        // If still not found and it's not an email, try using the Search API globally
+        if (!hsContact && !isEmail) {
+          try {
+            const searchBody = {
+              query: identifier, // Generic search across text/name fields
+              limit: 1,
+              properties: ["firstname", "lastname", "email", "company", "jobtitle"]
+            };
+            const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${ht}`, "Content-Type": "application/json" },
+              body: JSON.stringify(searchBody)
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.results && data.results.length > 0) {
+                hsContact = data.results[0];
+              }
+            }
+          } catch(e) { console.error("Error searching contact by name", e); }
+        }
+
+        // Cache the dynamically fetched contact for later use
+        if (hsContact) {
+          const exists = hubspotContacts.find(c => c.id === hsContact.id);
+          if (!exists) {
+            hubspotContacts.push(hsContact);
+          }
+        }
+      }
       
       if (hsContact) {
         isHubspotContact = true;
         lead = {
           name: `${hsContact.properties?.firstname || ''} ${hsContact.properties?.lastname || ''}`.trim(),
           email: hsContact.properties?.email,
-          company: hsContact.properties?.company || 'Unknown', // HubSpot might not have company in base properties, but we set a default
+          company: company || hsContact.properties?.company || 'Unknown', // HubSpot might not have company in base properties unless requested, and explicit input takes precedence
           title: hsContact.properties?.jobtitle || 'Unknown',
           contextForAI: 'This contact was imported from HubSpot. We have limited context about them.',
           about: 'N/A'

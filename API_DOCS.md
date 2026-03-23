@@ -86,6 +86,7 @@
 ```json
 {
   "identifier": "Bill Gates",
+  "company": "Microsoft",
   "context": "We are selling an AI-powered CRM tool for enterprise companies."
 }
 ```
@@ -93,6 +94,7 @@
 | Field        | Type     | Required | Description                                                                                                                             |
 | ------------ | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `identifier` | `string` | ✅ Yes   | Used to find the lead. Can be: **name**, **email**, **url**, or **profileUrl**                                                          |
+| `company`    | `string` | ❌ No    | Explicitly provide the company name, taking precedence over default scraped or CRM data                                                 |
 | `context`    | `string` | ❌ No    | Additional instructions or context for the AI to tailor the email (e.g. what product you're selling, the tone, specific talking points) |
 
 #### Success Response — `200`
