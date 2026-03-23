@@ -205,6 +205,90 @@ app.get('/api/hubspot/contacts/:count', async (c) => {
     results: paginatedContacts
   })
 })
+
+// Endpoint to search HubSpot contacts directly via HubSpot API
+app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
+  try {
+    let body: any = {};
+    if (c.req.method === 'POST') {
+      try {
+        body = await c.req.json();
+      } catch (e) {
+        // ignore JSON parse error
+      }
+    }
+    
+    // Support both body and query params
+    const company = body.company || c.req.query('company');
+    const role = body.role || c.req.query('role');
+    const region = body.region || c.req.query('region');
+    const limit = parseInt(body.limit || c.req.query('limit') || '50', 10);
+    const after = body.after || c.req.query('after');
+
+    const ht = process.env.HUBSPOT_TOKEN;
+    if (!ht) {
+      return c.json({ error: 'HUBSPOT_TOKEN is not set.' }, 500);
+    }
+
+    const filters: any[] = [];
+    
+    if (company) {
+      filters.push({ propertyName: 'company', operator: 'CONTAINS_TOKEN', value: company });
+    }
+    if (role) {
+      filters.push({ propertyName: 'jobtitle', operator: 'CONTAINS_TOKEN', value: role });
+    }
+    
+    let filterGroups: any[] = [];
+    
+    // If region is specified, we check state, city, or country using OR logic (multiple filter groups)
+    if (region) {
+      filterGroups = [
+        { filters: [...filters, { propertyName: 'state', operator: 'CONTAINS_TOKEN', value: region }] },
+        { filters: [...filters, { propertyName: 'city', operator: 'CONTAINS_TOKEN', value: region }] },
+        { filters: [...filters, { propertyName: 'country', operator: 'CONTAINS_TOKEN', value: region }] }
+      ];
+    } else if (filters.length > 0) {
+      // Just apply standard AND filters
+      filterGroups = [{ filters }];
+    }
+
+    const searchBody: any = {
+      limit: limit,
+      // Request standard properties to return
+      properties: ["firstname", "lastname", "email", "company", "jobtitle", "state", "city", "country"]
+    };
+
+    if (filterGroups.length > 0) {
+      searchBody.filterGroups = filterGroups;
+    }
+    if (after) {
+      searchBody.after = after;
+    }
+
+    const response = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
+      method: "POST", // The HubSpot CRM Search API requires a POST request always
+      headers: {
+        Authorization: `Bearer ${ht}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(searchBody)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("HubSpot Search API Error:", response.status, errText);
+      return c.json({ error: 'HubSpot API error', details: errText }, response.status as any);
+    }
+
+    const data = await response.json();
+    return c.json(data);
+  } catch (error: any) {
+    console.error('Error in /api/hubspot/search:', error);
+    return c.json({ error: 'Failed to search Hubspot contacts', details: error.message }, 500);
+  }
+})
+
 // Endpoint to generate personalized email
 app.post('/api/generate-email', async (c) => {
   try {

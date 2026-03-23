@@ -181,6 +181,63 @@
 
 ---
 
+### 5. Search HubSpot Contacts Directly
+
+|                  |                    |
+| ---------------- | ------------------ |
+| **Method**       | `POST` or `GET`    |
+| **URL**          | `/api/hubspot/search` |
+| **Content-Type** | `application/json` (if POST) |
+
+#### Query Parameters or Request Body
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `company` | `string` | Filter by company name |
+| `role` | `string` | Filter by job title |
+| `region` | `string` | Filter by state, city, or country |
+| `limit` | `number` | Number of results to return (default: `50`) |
+| `after` | `string` | Pagination cursor returned from a previous search |
+
+#### Example Search Request Body
+```json
+{
+  "company": "Coresight",
+  "role": "Manager",
+  "region": "California"
+}
+```
+*Alternatively, you can provide the parameters in the URL:*
+`/api/hubspot/search?company=Coresight&role=Manager&region=California`
+
+#### Success Response
+```json
+{
+  "total": 15,
+  "results": [
+    {
+      "id": "12345",
+      "properties": {
+        "firstname": "John",
+        "lastname": "Doe",
+        "company": "Coresight",
+        "jobtitle": "Marketing Manager",
+        "state": "California",
+        "city": "Los Angeles",
+        "country": "United States"
+      }
+    }
+  ],
+  "paging": {
+    "next": {
+      "after": "100"
+    }
+  }
+}
+```
+
+---
+
 ## Frontend Integration Examples
 
 ### Fetch All Leads
