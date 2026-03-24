@@ -243,6 +243,78 @@
 
 ---
 
+## 6. Group Management and Bulk Actions
+
+### 6.1 Get All Groups
+**GET** `/api/groups`
+Returns an array of all saved groups.
+
+### 6.2 Create a Group
+**POST** `/api/groups`
+```json
+{
+  "name": "Q3 CEO Campaign"
+}
+```
+
+### 6.3 Update Contacts in a Group
+**PUT** `/api/groups/:id/contacts`
+Replace the entire list of contacts in a group.
+```json
+{
+  "contacts": [
+    { "identifier": "bill@example.com", "leadSource": "linkedin", "name": "Bill Gates" },
+    { "identifier": "51", "leadSource": "hubspot" }
+  ]
+}
+```
+
+### 6.4 Add Contacts to a Group (Append)
+**POST** `/api/groups/:id/contacts`
+Appends new contacts to an existing group without deleting the old ones.
+```json
+{
+  "contacts": [
+    { "identifier": "newuser@example.com", "leadSource": "linkedin", "name": "New User" }
+  ]
+}
+```
+
+### 6.5 Remove a Contact from a Group
+**DELETE** `/api/groups/:id/contacts/:identifier`
+Removes a specific contact from the group by their exact `identifier`. (For emails and URLs, ensure the parameter is URL-encoded).
+
+### 6.6 Generate Bulk Emails
+**POST** `/api/bulk-generate-email`
+Pass a `groupId` to generate emails for an entire saved group, or pass an array of `identifiers` manually.
+```json
+{
+  "groupId": "64abcdef1234567890abcdef",
+  "context": "Mention our new AI pricing model."
+}
+```
+**Returns:**
+```json
+{
+  "results": [
+    { "identifier": "51", "success": true, "text": "Subject: ...", "leadName": "John" }
+  ]
+}
+```
+
+### 6.7 Send Bulk Emails
+**POST** `/api/bulk-send-email`
+Pass an array of emails to logically send them all concurrently.
+```json
+{
+  "emails": [
+    { "to": "test@example.com", "subject": "Hello", "text": "Hi there..." }
+  ]
+}
+```
+
+---
+
 ## Frontend Integration Examples
 
 ### Fetch All Leads

@@ -6,10 +6,34 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 import 'dotenv/config';
 import nodemailer from 'nodemailer';
+import mongoose from 'mongoose';
 
 const app = new Hono()
 
 app.use('/*', cors())
+
+// Connect to MongoDB
+if (process.env.MONGODB_URI) {
+  mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('Connected to MongoDB successfully'))
+    .catch((err) => console.error('MongoDB connection error:', err));
+} else {
+  console.warn('MONGODB_URI is not set. Grouping features will not work until a database is configured.');
+}
+
+// Define the Group schema definition
+const groupSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+  contacts: [{
+    identifier: { type: String, required: true }, // Email, Profile URL, or HubSpot ID
+    leadSource: { type: String, required: true }, // 'linkedin' or 'hubspot'
+    name: { type: String }, 
+    company: { type: String },
+  }]
+});
+
+const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
 
@@ -114,6 +138,98 @@ async function ensureHubspotContacts(requiredCount: number) {
     isFetchingHubspot = false;
   }
 }
+
+// --------------- GROUPING ENDPOINTS ---------------
+
+// Get all groups
+app.get('/api/groups', async (c) => {
+  try {
+    const groups = await Group.find().sort({ createdAt: -1 });
+    return c.json(groups);
+  } catch (err: any) {
+    return c.json({ error: 'Failed to fetch groups', details: err.message }, 500);
+  }
+});
+
+// Create a new group
+app.post('/api/groups', async (c) => {
+  try {
+    const body = await c.req.json();
+    if (!body.name) {
+      return c.json({ error: 'Group name is required' }, 400);
+    }
+    const newGroup = await Group.create({ name: body.name, contacts: [] });
+    return c.json(newGroup, 201);
+  } catch (err: any) {
+    return c.json({ error: 'Failed to create group', details: err.message }, 500);
+  }
+});
+
+// Add or update contacts in a group
+app.put('/api/groups/:id/contacts', async (c) => {
+  try {
+    const groupId = c.req.param('id');
+    const { contacts } = await c.req.json();
+    
+    if (!Array.isArray(contacts)) {
+      return c.json({ error: 'Contacts must be an array' }, 400);
+    }
+
+    const group = await Group.findByIdAndUpdate(
+      groupId, 
+      { contacts }, // Replace the entire array with the submitted array 
+      { new: true }
+    );
+
+    if (!group) return c.json({ error: 'Group not found' }, 404);
+    
+    return c.json(group);
+  } catch (err: any) {
+    return c.json({ error: 'Failed to update group contacts', details: err.message }, 500);
+  }
+});
+
+// Append contacts to a group
+app.post('/api/groups/:id/contacts', async (c) => {
+  try {
+    const groupId = c.req.param('id');
+    const { contacts } = await c.req.json();
+    
+    if (!Array.isArray(contacts)) {
+      return c.json({ error: 'Contacts must be an array' }, 400);
+    }
+
+    const group = await Group.findById(groupId);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
+
+    // Append only non-existing ones
+    const newContacts = contacts.filter((cc: any) => !group.contacts.some((exc: any) => exc.identifier === cc.identifier));
+    group.contacts.push(...newContacts);
+    await group.save();
+    
+    return c.json(group);
+  } catch (err: any) {
+    return c.json({ error: 'Failed to add contacts to group', details: err.message }, 500);
+  }
+});
+
+// Remove a contact from a group
+app.delete('/api/groups/:id/contacts/:identifier', async (c) => {
+  try {
+    const groupId = c.req.param('id');
+    const identifier = decodeURIComponent(c.req.param('identifier'));
+
+    const group = await Group.findById(groupId);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
+
+    group.contacts = group.contacts.filter((contact: any) => contact.identifier !== identifier);
+    await group.save();
+
+    return c.json(group);
+  } catch (err: any) {
+    return c.json({ error: 'Failed to remove contact from group', details: err.message }, 500);
+  }
+});
 
 app.get('/', (c) => {
   return c.text('Email Lead Generation API is running!')
@@ -308,106 +424,101 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
   }
 })
 
-// Endpoint to generate personalized email
-app.post('/api/generate-email', async (c) => {
-  try {
-    const body = await c.req.json()
-    const { identifier, context, company } = body
-    
-    // Find the lead in regular leads first
-    let lead = leads.find(l => 
-      l.email === identifier || 
-      l.profileUrl === identifier || 
-      l.url === identifier ||
-      l.name === identifier
+async function generateEmailForLead(identifier: string, company?: string, context?: string) {
+  // Find the lead in regular leads first
+  let lead = leads.find(l => 
+    l.email === identifier || 
+    l.profileUrl === identifier || 
+    l.url === identifier ||
+    l.name === identifier
+  )
+  
+  if (lead && company) {
+    // Override or populate with the explicitly provided company
+    lead.company = company;
+  }
+  
+  let isHubspotContact = false;
+
+  // If not found in leads, search in HubSpot contacts
+  if (!lead) {
+    let hsContact = hubspotContacts.find(c => 
+      c.properties?.email === identifier ||
+      c.id === identifier ||
+      `${c.properties?.firstname || ''} ${c.properties?.lastname || ''}`.trim() === identifier
     )
     
-    if (lead && company) {
-      // Override or populate with the explicitly provided company
-      lead.company = company;
-    }
-    
-    let isHubspotContact = false;
-
-    // If not found in leads, search in HubSpot contacts
-    if (!lead) {
-      let hsContact = hubspotContacts.find(c => 
-        c.properties?.email === identifier ||
-        c.id === identifier ||
-        `${c.properties?.firstname || ''} ${c.properties?.lastname || ''}`.trim() === identifier
-      )
+    // If contact was not found locally (maybe found via HubSpot search endpoint instead), fetch it from HubSpot API
+    if (!hsContact && process.env.HUBSPOT_TOKEN) {
+      const ht = process.env.HUBSPOT_TOKEN;
+      const isEmail = identifier.includes('@');
       
-      // If contact was not found locally (maybe found via HubSpot search endpoint instead), fetch it from HubSpot API
-      if (!hsContact && process.env.HUBSPOT_TOKEN) {
-        const ht = process.env.HUBSPOT_TOKEN;
-        const isEmail = identifier.includes('@');
-        
+      try {
+        const idProp = isEmail ? '&idProperty=email' : '';
+        const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle,hs_email_last_open_date,hs_email_last_click_date${idProp}`, {
+          headers: { Authorization: `Bearer ${ht}` }
+        });
+        if (res.ok) {
+          hsContact = await res.json();
+        }
+      } catch(e) { console.error("Error fetching contact by ID/Email", e); }
+      
+      // If still not found and it's not an email, try using the Search API globally
+      if (!hsContact && !isEmail) {
         try {
-          const idProp = isEmail ? '&idProperty=email' : '';
-          const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle,hs_email_last_open_date,hs_email_last_click_date${idProp}`, {
-            headers: { Authorization: `Bearer ${ht}` }
+          const searchBody = {
+            query: identifier, // Generic search across text/name fields
+            limit: 1,
+            properties: ["firstname", "lastname", "email", "company", "jobtitle", "hs_email_last_open_date", "hs_email_last_click_date"]
+          };
+          const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${ht}`, "Content-Type": "application/json" },
+            body: JSON.stringify(searchBody)
           });
           if (res.ok) {
-            hsContact = await res.json();
-          }
-        } catch(e) { console.error("Error fetching contact by ID/Email", e); }
-        
-        // If still not found and it's not an email, try using the Search API globally
-        if (!hsContact && !isEmail) {
-          try {
-            const searchBody = {
-              query: identifier, // Generic search across text/name fields
-              limit: 1,
-              properties: ["firstname", "lastname", "email", "company", "jobtitle", "hs_email_last_open_date", "hs_email_last_click_date"]
-            };
-            const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
-              method: "POST",
-              headers: { Authorization: `Bearer ${ht}`, "Content-Type": "application/json" },
-              body: JSON.stringify(searchBody)
-            });
-            if (res.ok) {
-              const data = await res.json();
-              if (data.results && data.results.length > 0) {
-                hsContact = data.results[0];
-              }
+            const data = await res.json();
+            if (data.results && data.results.length > 0) {
+              hsContact = data.results[0];
             }
-          } catch(e) { console.error("Error searching contact by name", e); }
-        }
-
-        // Cache the dynamically fetched contact for later use
-        if (hsContact) {
-          const exists = hubspotContacts.find(c => c.id === hsContact.id);
-          if (!exists) {
-            hubspotContacts.push(hsContact);
           }
-        }
+        } catch(e) { console.error("Error searching contact by name", e); }
       }
-      
+
+      // Cache the dynamically fetched contact for later use
       if (hsContact) {
-        isHubspotContact = true;
-        lead = {
-          name: `${hsContact.properties?.firstname || ''} ${hsContact.properties?.lastname || ''}`.trim(),
-          email: hsContact.properties?.email,
-          company: company || hsContact.properties?.company || 'Unknown', // HubSpot might not have company in base properties unless requested, and explicit input takes precedence
-          title: hsContact.properties?.jobtitle || 'Unknown',
-          contextForAI: 'This contact was imported from HubSpot. We have limited context about them.',
-          about: 'N/A'
+        const exists = hubspotContacts.find(c => c.id === hsContact.id);
+        if (!exists) {
+          hubspotContacts.push(hsContact);
         }
       }
     }
-
-    if (!lead) {
-      return c.json({ error: 'Lead/Contact not found. Please provide a valid email, profileUrl, url, or name as identifier.' }, 404)
-    }
-
-    const aiContext = lead.contextForAI || ''
     
-    // Adjust prompt based on whether it's a rich lead or a basic HubSpot contact
-    const contextInstruction = isHubspotContact 
-      ? `This is a contact imported from our CRM (HubSpot). We have limited context about them. Rely more on generic professional outreach best practices and the User Instructions provided below, while keeping it personalized to their name, title, and company if available.`
-      : `Generate a highly personalized cold outreach email for the following lead based on their detailed profile data and context.`;
+    if (hsContact) {
+      isHubspotContact = true;
+      lead = {
+        name: `${hsContact.properties?.firstname || ''} ${hsContact.properties?.lastname || ''}`.trim(),
+        email: hsContact.properties?.email,
+        company: company || hsContact.properties?.company || 'Unknown', // HubSpot might not have company in base properties unless requested, and explicit input takes precedence
+        title: hsContact.properties?.jobtitle || 'Unknown',
+        contextForAI: 'This contact was imported from HubSpot. We have limited context about them.',
+        about: 'N/A'
+      }
+    }
+  }
 
-    const prompt = `
+  if (!lead) {
+    throw new Error('Lead/Contact not found. Please provide a valid email, profileUrl, url, or name as identifier.');
+  }
+
+  const aiContext = lead.contextForAI || ''
+  
+  // Adjust prompt based on whether it's a rich lead or a basic HubSpot contact
+  const contextInstruction = isHubspotContact 
+    ? `This is a contact imported from our CRM (HubSpot). We have limited context about them. Rely more on generic professional outreach best practices and the User Instructions provided below, while keeping it personalized to their name, title, and company if available.`
+    : `Generate a highly personalized cold outreach email for the following lead based on their detailed profile data and context.`;
+
+  const prompt = `
 You are an expert sales development representative (SDR) working for Coresight Research (coresight.com). 
 Coresight Research delivers data-driven insights focusing on retail and technology, helping businesses navigate disruption reshaping global retail through proprietary intelligence and a global community of industry leaders.
 
@@ -452,27 +563,69 @@ ${aiContext}
 
 User Instructions/Context:
 ${context || 'None'}
-    `.trim()
+  `.trim()
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-    })
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+  })
 
-    const emailContent = response.text
+  return { text: response.text, leadName: lead.name };
+}
 
-    // Return plain text as well for proper displays
+// Endpoint to generate personalized email
+app.post('/api/generate-email', async (c) => {
+  try {
+    const { identifier, context, company } = await c.req.json();
+    const result = await generateEmailForLead(identifier, company, context);
+
     return c.json({ 
       success: true,
-      text: emailContent,
-      leadName: lead.name
-    })
-
-  } catch (error) {
-    console.error("Error generating email:", error)
-    return c.json({ error: 'Failed to generate email' }, 500)
+      text: result.text,
+      leadName: result.leadName
+    });
+  } catch (error: any) {
+    console.error("Error generating email:", error);
+    return c.json({ error: error.message || 'Failed to generate email' }, 500);
   }
-})
+});
+
+// Endpoint to bulk generate emails for a group
+app.post('/api/bulk-generate-email', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { groupId, identifiers, context } = body;
+    let targets: { identifier: string; company?: string }[] = [];
+
+    if (groupId) {
+      const group = await Group.findById(groupId);
+      if (!group) return c.json({ error: 'Group not found' }, 404);
+      targets = group.contacts.map((contact: any) => ({ identifier: contact.identifier, company: contact.company }));
+    } else if (Array.isArray(identifiers)) {
+      targets = identifiers.map(id => typeof id === 'string' ? { identifier: id } : id);
+    } else {
+      return c.json({ error: 'Must provide groupId or an array of identifiers' }, 400);
+    }
+
+    // Process concurrently
+    const results = await Promise.allSettled(
+      targets.map(t => generateEmailForLead(t.identifier, t.company, context))
+    );
+
+    const generated = results.map((result, index) => {
+      if (result.status === 'fulfilled') {
+        return { identifier: targets[index].identifier, success: true, ...result.value };
+      } else {
+        return { identifier: targets[index].identifier, success: false, error: result.reason?.message || 'Failed' };
+      }
+    });
+
+    return c.json({ results: generated });
+  } catch (err: any) {
+    console.error('Error in bulk generate:', err);
+    return c.json({ error: 'Bulk generation failed', details: err.message }, 500);
+  }
+});
 
 // Nodemailer transporter (Gmail)
 const transporter = nodemailer.createTransport({
@@ -510,6 +663,40 @@ app.post('/api/send-email', async (c) => {
   } catch (error: any) {
     console.error('Error sending email:', error);
     return c.json({ error: 'Failed to send email', details: error.message }, 500);
+  }
+});
+
+// Endpoint to send bulk emails concurrently
+app.post('/api/bulk-send-email', async (c) => {
+  try {
+    const { emails } = await c.req.json();
+    
+    if (!Array.isArray(emails)) {
+      return c.json({ error: 'Missing required field: emails array' }, 400);
+    }
+
+    // Process sends concurrently via Promise.allSettled
+    const results = await Promise.allSettled(
+      emails.map(email => transporter.sendMail({
+        from: process.env.SMTP_USER || 'elijahandrew1610@gmail.com',
+        to: email.to,
+        subject: email.subject,
+        text: email.text,
+      }))
+    );
+
+    const sent = results.map((result, index) => {
+      if (result.status === 'fulfilled') {
+        return { to: emails[index].to, success: true, messageId: result.value.messageId };
+      } else {
+        return { to: emails[index].to, success: false, error: result.reason?.message };
+      }
+    });
+
+    return c.json({ results: sent });
+  } catch (error: any) {
+    console.error('Error in bulk send:', error);
+    return c.json({ error: 'Failed to send bulk emails', details: error.message }, 500);
   }
 });
 
