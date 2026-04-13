@@ -6,8 +6,16 @@
 
 ## Agent Pipeline (recommended flow)
 
-The agent now runs in three stages. Use these endpoints in sequence:
+Two entry points depending on your data source:
 
+**Starting from HubSpot contacts (new):**
+```
+1. POST /api/agent/hubspot-to-linkedin      → Gemini finds LinkedIn profile for each HubSpot contact
+2. POST /api/agent/rank-csuite-targets      → score & filter to C-suite leads
+3. POST /api/agent/save-candidates          → persist accepted leads
+```
+
+**Starting from public search (original):**
 ```
 1. POST /api/agent/search-public-profiles   → discover LinkedIn profile URLs
 2. POST /api/agent/extract-profile-signals  → fetch & parse each profile (HTML + AI)
@@ -16,7 +24,7 @@ The agent now runs in three stages. Use these endpoints in sequence:
 5. POST /api/agent/save-candidates          → persist accepted leads
 ```
 
-Steps 2 and 3 are complementary — run 3 on the output of 2 for any candidates still flagged `insufficientPublicData`.
+Steps 2 and 3 of the public search flow are complementary — run 3 on the output of 2 for any candidates still flagged `insufficientPublicData`.
 
 ---
 
@@ -249,7 +257,10 @@ Steps 2 and 3 are complementary — run 3 on the output of 2 for any candidates 
         "state": "California",
         "city": "Los Angeles",
         "country": "United States",
-        "hs_email_last_open_date": "2024-05-12T08:32:00Z"
+        "industry": "Retail",
+        "hs_email_last_open_date": "2024-05-12T08:32:00Z",
+        "hs_email_last_click_date": "2024-05-13T10:00:00Z",
+        "notes_last_activity_date": "2024-06-01T00:00:00Z"
       }
     }
   ],
@@ -261,11 +272,102 @@ Steps 2 and 3 are complementary — run 3 on the output of 2 for any candidates 
 }
 ```
 
+| Property | Description |
+| --- | --- |
+| `industry` | Industry as set in HubSpot (e.g. `"Retail"`, `"Real Estate"`). `null` if not set. |
+| `notes_last_activity_date` | Date of the contact's last recorded activity in HubSpot. `null` if blank. |
+| `hs_email_last_open_date` | Last date the contact opened an email sent via HubSpot. |
+| `hs_email_last_click_date` | Last date the contact clicked a link in a HubSpot email. |
+```
+
 ---
 
 ## 6. Agentic LinkedIn Lead Intake (Phase 1 MVP)
 
 All endpoints below are best-effort public-page collection only (no login required, no paid fallback source).
+
+### 6.0 HubSpot → LinkedIn Agent (Gemini-powered)
+**POST** `/api/agent/hubspot-to-linkedin`
+
+Uses Gemini AI with function-calling tools to find the LinkedIn profile for each contact already in HubSpot. Gemini is given two tools it can call autonomously:
+- `search_web` — searches DuckDuckGo (Bing fallback) and returns any `linkedin.com/in/` URLs found
+- `fetch_linkedin_page` — fetches a LinkedIn profile page to confirm name/title/company match
+
+Returns candidates in the **standard agent format**, ready to pipe directly into `POST /api/agent/rank-csuite-targets` and `POST /api/agent/save-candidates`.
+
+> **Note:** Only contacts that have both a name and a company are eligible (required for a meaningful search). Cap `limit` at 25 per call to stay within Gemini rate limits.
+
+Fetches contacts **directly from the HubSpot API** on every call (no in-memory cache). Supports cursor-based pagination via `nextCursor`.
+
+#### Request Body
+
+```json
+{
+  "limit": 10,
+  "after": "optional-cursor-from-previous-response"
+}
+```
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `limit` | `number` | `10` | How many HubSpot contacts to fetch and process per call. Max `25`. |
+| `after` | `string` | — | Pagination cursor. Pass the `nextCursor` value from a previous response to get the next page. |
+
+#### Success Response
+
+```json
+{
+  "processed": 10,
+  "eligible": 8,
+  "found": 6,
+  "notFound": 2,
+  "nextCursor": "AoJ...",
+  "note": "Pipe candidates into POST /api/agent/rank-csuite-targets then POST /api/agent/save-candidates. Pass nextCursor as 'after' to process the next page.",
+  "candidates": [
+    {
+      "identifier": "https://linkedin.com/in/jane-doe",
+      "profileUrl": "https://linkedin.com/in/jane-doe",
+      "name": "Jane Doe",
+      "title": "Chief Operating Officer",
+      "company": "Acme Corp",
+      "sector": "retail",
+      "isCSuite": true,
+      "confidence": 0.8,
+      "provenance": {
+        "sourceUrl": "https://linkedin.com/in/jane-doe",
+        "fetchedAt": "2026-04-13T00:00:00.000Z",
+        "method": "hubspot-to-linkedin-agent"
+      },
+      "signals": {
+        "titleMatch": true,
+        "sectorMatch": true,
+        "companyMatch": true
+      },
+      "hubspotId": "12345",
+      "hubspotEmail": "jane@acmecorp.com"
+    }
+  ]
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `processed` | Total contacts fetched from HubSpot on this call |
+| `eligible` | Contacts that had both a name and company (required for LinkedIn search) |
+| `found` | Contacts for which a LinkedIn profile was found |
+| `notFound` | Contacts where Gemini could not find a confident match |
+| `nextCursor` | Pass as `after` in the next request to get the next page. `null` means no more pages. |
+```
+
+#### Recommended flow
+
+```
+1. POST /api/agent/hubspot-to-linkedin       → discover LinkedIn profiles for HubSpot contacts
+2. POST /api/agent/rank-csuite-targets       → score & filter to C-suite leads
+3. POST /api/agent/save-candidates           → persist accepted leads
+```
+
+---
 
 ### 6.1 Search Public Profiles
 **POST** `/api/agent/search-public-profiles`

@@ -396,6 +396,8 @@ async function ensureHubspotContacts(requiredCount: number) {
       url.searchParams.append("properties", "jobtitle");
       url.searchParams.append("properties", "hs_email_last_open_date");
       url.searchParams.append("properties", "hs_email_last_click_date");
+      url.searchParams.append("properties", "industry");
+      url.searchParams.append("properties", "notes_last_activity_date");
 
       if (hubspotCursor) {
         url.searchParams.set("after", hubspotCursor);
@@ -446,6 +448,167 @@ async function ensureHubspotContacts(requiredCount: number) {
 function apiError(code: string, message: string, details?: any) {
   return { error: { code, message, details: details || null } }
 }
+
+// ---- Gemini Tool implementations for the hubspot-to-linkedin agent ----
+
+async function toolSearchWeb(query: string): Promise<string> {
+  if (!query) return 'empty query'
+  const searchUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+  try {
+    const response = await fetch(searchUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeadIntakeBot/1.0; +https://coresight.com)' }
+    })
+    if (!response.ok) {
+      const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+      const bingRes = await fetch(bingUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeadIntakeBot/1.0; +https://coresight.com)' }
+      })
+      if (!bingRes.ok) return `Search failed: ${response.status}`
+      const html = await bingRes.text()
+      const urls = extractLinkedinProfileUrls(html)
+      return JSON.stringify({ linkedinUrls: urls.slice(0, 5), source: 'bing' })
+    }
+    const html = await response.text()
+    const urls = extractLinkedinProfileUrls(html)
+    return JSON.stringify({ linkedinUrls: urls.slice(0, 5), source: 'duckduckgo' })
+  } catch (e: any) {
+    return `Search error: ${e.message}`
+  }
+}
+
+async function toolFetchLinkedInPage(url: string): Promise<string> {
+  const normalizedUrl = normalizeProfileUrl(url)
+  if (!normalizedUrl || !/linkedin\.com\/in\//i.test(normalizedUrl)) {
+    return 'Only linkedin.com/in/ profile URLs are supported'
+  }
+  try {
+    const response = await fetch(normalizedUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeadIntakeBot/1.0; +https://coresight.com)' }
+    })
+    if (!response.ok) return `Fetch failed: ${response.status}`
+    const html = await response.text()
+    const titleMatch = html.match(/<title>(.*?)<\/title>/i)
+    const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["'][^>]*>/i)
+    const pageTitle = safeText(titleMatch?.[1] || '')
+    const metaDescription = safeText(descMatch?.[1] || '')
+    const parsed = parseLinkedinTitlePage(pageTitle)
+    const inferredTitle = extractJobTitleFromMeta(metaDescription)
+    return JSON.stringify({ url: normalizedUrl, pageTitle, metaDescription, parsedName: parsed.name, parsedCompany: parsed.company, inferredTitle })
+  } catch (e: any) {
+    return `Fetch error: ${e.message}`
+  }
+}
+
+const LINKEDIN_TOOL_DECLARATIONS = [
+  {
+    name: 'search_web',
+    description: 'Search DuckDuckGo (with Bing fallback) for LinkedIn profiles. Returns an array of linkedin.com/in/ URLs found.',
+    parametersJsonSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query, e.g. "John Smith CEO Acme Corp site:linkedin.com/in"' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'fetch_linkedin_page',
+    description: 'Fetch a LinkedIn profile page and return its page title and meta description to confirm the person\'s name, title, and company.',
+    parametersJsonSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Full linkedin.com/in/ profile URL to fetch' }
+      },
+      required: ['url']
+    }
+  }
+]
+
+async function findLinkedInForContact(contact: any): Promise<{ profileUrl: string; name: string; title: string; company: string; confidence: number } | null> {
+  const firstName = safeText(contact.properties?.firstname)
+  const lastName = safeText(contact.properties?.lastname)
+  const name = `${firstName} ${lastName}`.trim()
+  const company = safeText(contact.properties?.company)
+  const title = safeText(contact.properties?.jobtitle)
+
+  if (!name) return null
+
+  const userPrompt = `Find the LinkedIn profile URL for this person:
+Name: ${name}
+Company: ${company || 'unknown'}
+Title: ${title || 'unknown'}
+
+Steps:
+1. Use search_web with a query like "${name} ${company} linkedin" to find candidate LinkedIn profile URLs.
+2. If you get one or more linkedin.com/in/ URLs, use fetch_linkedin_page on the most likely one to confirm the name, title, and company match.
+3. Return a single JSON object — no markdown fences — in this exact shape:
+{"profileUrl":"","name":"","title":"","company":"","confidence":0.0}
+
+Rules:
+- profileUrl must be a linkedin.com/in/ URL, or empty string if not found.
+- confidence is 0.0–1.0: use 0.9 for a strong name+company match, 0.5 for a partial match, 0.0 if not found.
+- If you cannot find the right profile after searching, return {"profileUrl":"","name":"${name}","title":"${title}","company":"${company}","confidence":0.0}`
+
+  let contents: any[] = [{ role: 'user', parts: [{ text: userPrompt }] }]
+  let maxTurns = 6
+
+  while (maxTurns-- > 0) {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents,
+      config: { tools: [{ functionDeclarations: LINKEDIN_TOOL_DECLARATIONS }] }
+    })
+
+    const candidate = response.candidates?.[0]
+    if (!candidate?.content?.parts) break
+
+    const parts = candidate.content.parts
+    const functionCallParts = parts.filter((p: any) => p.functionCall)
+
+    contents.push({ role: 'model', parts })
+
+    if (functionCallParts.length === 0) {
+      const text = parts.filter((p: any) => p.text).map((p: any) => p.text).join('')
+      const jsonMatch = text.match(/\{[\s\S]*?\}/)
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0])
+          const profileUrl = normalizeProfileUrl(String(parsed.profileUrl || ''))
+          if (profileUrl && /linkedin\.com\/in\//i.test(profileUrl)) {
+            return {
+              profileUrl,
+              name: safeText(parsed.name) || name,
+              title: safeText(parsed.title) || title,
+              company: safeText(parsed.company) || company,
+              confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.5))
+            }
+          }
+        } catch { /* malformed JSON — fall through */ }
+      }
+      break
+    }
+
+    const toolResultParts: any[] = []
+    for (const part of functionCallParts) {
+      const fc = part.functionCall as any
+      const toolName: string = fc?.name ?? ''
+      const args: any = fc?.args ?? {}
+      let result = 'unknown tool'
+      if (toolName === 'search_web') {
+        result = await toolSearchWeb(String(args?.query || ''))
+      } else if (toolName === 'fetch_linkedin_page') {
+        result = await toolFetchLinkedInPage(String(args?.url || ''))
+      }
+      toolResultParts.push({ functionResponse: { name: toolName, response: { result } } })
+    }
+
+    contents.push({ role: 'user', parts: toolResultParts })
+  }
+
+  return null
+}
+
+// -----------------------------------------------------------------------
 
 app.post('/api/agent/search-public-profiles', async (c) => {
   try {
@@ -921,6 +1084,137 @@ app.post('/api/agent/save-candidates', async (c) => {
   }
 })
 
+// --------------- HUBSPOT → LINKEDIN AGENT ---------------
+
+// Uses Gemini with function-calling tools (search_web + fetch_linkedin_page) to
+// discover LinkedIn profiles for contacts already in HubSpot. The returned
+// candidates are in the standard agent format and can be piped directly to
+// POST /api/agent/rank-csuite-targets and POST /api/agent/save-candidates.
+app.post('/api/agent/hubspot-to-linkedin', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    // Hard cap at 25 per call to stay within Gemini rate limits (each contact = up to 6 turns)
+    const limit = Math.min(Number(body.limit || 10), 25)
+    // HubSpot cursor for pagination — pass the `nextCursor` from a previous response to get the next page
+    const after = body.after ? String(body.after) : undefined
+
+    if (!process.env.GEMINI_API_KEY) {
+      return c.json(apiError('CONFIG_ERROR', 'GEMINI_API_KEY is not set'), 500)
+    }
+    if (!process.env.HUBSPOT_TOKEN) {
+      return c.json(apiError('CONFIG_ERROR', 'HUBSPOT_TOKEN is not set'), 500)
+    }
+
+    // Fetch directly from HubSpot API — no in-memory cache involved
+    const hsUrl = new URL('https://api.hubapi.com/crm/v3/objects/contacts')
+    hsUrl.searchParams.set('limit', String(limit))
+    hsUrl.searchParams.append('properties', 'firstname')
+    hsUrl.searchParams.append('properties', 'lastname')
+    hsUrl.searchParams.append('properties', 'email')
+    hsUrl.searchParams.append('properties', 'company')
+    hsUrl.searchParams.append('properties', 'jobtitle')
+    hsUrl.searchParams.append('properties', 'industry')
+    hsUrl.searchParams.append('properties', 'notes_last_activity_date')
+    if (after) hsUrl.searchParams.set('after', after)
+
+    const hsRes = await fetch(hsUrl.toString(), {
+      headers: { Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`, 'Content-Type': 'application/json' }
+    })
+
+    if (!hsRes.ok) {
+      const errText = await hsRes.text()
+      return c.json(apiError('HUBSPOT_ERROR', `HubSpot API returned ${hsRes.status}`, errText), 502)
+    }
+
+    const hsData = await hsRes.json()
+    const allContacts: any[] = hsData.results || []
+    const nextCursor: string | undefined = hsData.paging?.next?.after
+
+    // Only process contacts that have enough data for a meaningful LinkedIn search
+    const eligible = allContacts.filter(ct => {
+      const hasName = safeText(ct.properties?.firstname) || safeText(ct.properties?.lastname)
+      const hasCompany = safeText(ct.properties?.company)
+      return hasName && hasCompany
+    })
+
+    if (!eligible.length) {
+      return c.json({
+        processed: allContacts.length,
+        eligible: 0,
+        found: 0,
+        notFound: 0,
+        nextCursor: nextCursor || null,
+        note: 'No contacts on this page had both a name and company. Try nextCursor to advance to the next page.',
+        candidates: []
+      })
+    }
+
+    const candidates: any[] = []
+    let found = 0
+    let notFound = 0
+
+    for (const contact of eligible) {
+      const firstName = safeText(contact.properties?.firstname)
+      const lastName = safeText(contact.properties?.lastname)
+      const name = `${firstName} ${lastName}`.trim()
+      const company = safeText(contact.properties?.company)
+      const title = safeText(contact.properties?.jobtitle)
+
+      try {
+        const result = await findLinkedInForContact(contact)
+
+        if (result && result.profileUrl && result.confidence >= 0.4) {
+          const identifier = toStableIdentifier({ profileUrl: result.profileUrl, name: result.name })
+          const sector = inferSector(`${result.company} ${result.title}`)
+          const signals = {
+            titleMatch: isCSuiteTitle(result.title),
+            sectorMatch: TARGET_SECTORS.includes(sector as LeadSector),
+            companyMatch: !!result.company
+          }
+
+          candidates.push({
+            identifier,
+            profileUrl: result.profileUrl,
+            name: result.name || name,
+            title: result.title || title,
+            company: result.company || company,
+            sector,
+            isCSuite: signals.titleMatch,
+            confidence: deriveConfidence(signals, !!result.name, true),
+            provenance: {
+              sourceUrl: result.profileUrl,
+              fetchedAt: new Date().toISOString(),
+              method: 'hubspot-to-linkedin-agent'
+            },
+            signals,
+            hubspotId: contact.id,
+            hubspotEmail: safeText(contact.properties?.email)
+          })
+          found++
+        } else {
+          notFound++
+          console.log(`[hubspot-to-linkedin] No LinkedIn found for: ${name} @ ${company}`)
+        }
+      } catch (err: any) {
+        console.error(`[hubspot-to-linkedin] Error for ${name}:`, err.message)
+        notFound++
+      }
+    }
+
+    return c.json({
+      processed: allContacts.length,
+      eligible: eligible.length,
+      found,
+      notFound,
+      nextCursor: nextCursor || null,
+      note: 'Pipe candidates into POST /api/agent/rank-csuite-targets then POST /api/agent/save-candidates. Pass nextCursor as "after" to process the next page.',
+      candidates
+    })
+  } catch (error: any) {
+    return c.json(apiError('INTERNAL_ERROR', 'failed to run hubspot-to-linkedin agent', error?.message), 500)
+  }
+})
+
 // --------------- GROUPING ENDPOINTS ---------------
 
 // Get all groups
@@ -1173,7 +1467,7 @@ app.on(['GET', 'POST'], '/api/hubspot/search', async (c) => {
     const searchBody: any = {
       limit: limit,
       // Request standard properties to return
-      properties: ["firstname", "lastname", "email", "company", "jobtitle", "state", "city", "country", "hs_email_last_open_date", "hs_email_last_click_date"]
+      properties: ["firstname", "lastname", "email", "company", "jobtitle", "state", "city", "country", "hs_email_last_open_date", "hs_email_last_click_date", "industry", "notes_last_activity_date"]
     };
 
     if (filterGroups.length > 0) {
@@ -1287,7 +1581,7 @@ ${context || 'None'}
       
       try {
         const idProp = isEmail ? '&idProperty=email' : '';
-        const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle,hs_email_last_open_date,hs_email_last_click_date${idProp}`, {
+        const res = await fetch(`https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(identifier)}?properties=firstname,lastname,email,company,jobtitle,hs_email_last_open_date,hs_email_last_click_date,industry,notes_last_activity_date${idProp}`, {
           headers: { Authorization: `Bearer ${ht}` }
         });
         if (res.ok) {
@@ -1301,7 +1595,7 @@ ${context || 'None'}
           const searchBody = {
             query: identifier, // Generic search across text/name fields
             limit: 1,
-            properties: ["firstname", "lastname", "email", "company", "jobtitle", "hs_email_last_open_date", "hs_email_last_click_date"]
+            properties: ["firstname", "lastname", "email", "company", "jobtitle", "hs_email_last_open_date", "hs_email_last_click_date", "industry", "notes_last_activity_date"]
           };
           const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
             method: "POST",
