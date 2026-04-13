@@ -4,6 +4,22 @@
 
 ---
 
+## Agent Pipeline (recommended flow)
+
+The agent now runs in three stages. Use these endpoints in sequence:
+
+```
+1. POST /api/agent/search-public-profiles   → discover LinkedIn profile URLs
+2. POST /api/agent/extract-profile-signals  → fetch & parse each profile (HTML + AI)
+3. POST /api/agent/ai-enrich-profiles       → AI re-enrichment for any still-incomplete profiles
+4. POST /api/agent/rank-csuite-targets      → score & filter to C-suite leads
+5. POST /api/agent/save-candidates          → persist accepted leads
+```
+
+Steps 2 and 3 are complementary — run 3 on the output of 2 for any candidates still flagged `insufficientPublicData`.
+
+---
+
 ## Endpoints
 
 ### 1. Health Check
@@ -73,7 +89,7 @@
 | `isCSuite`      | `boolean` | Whether the lead is a C-suite executive                    |
 | `searchKeyword` | `string?` | The keyword used to find this lead                         |
 
-> **Note:** LinkedIn-related workflows use `src/linkedin.json` as the primary source, then merge non-duplicate records from `src/leads.json`. If both files contain the same lead, the `linkedin.json` record is kept. The backend also normalizes LinkedIn records so `companyName` maps into `company`, and `companyWebsite` is preserved.
+> **Note:** LinkedIn-related workflows now use a hybrid intake path (public search/fetch + dedupe + persistence). `src/linkedin.json` is retained as a bootstrap fallback source when anonymous public collection is blocked.
 
 ---
 
@@ -247,13 +263,101 @@
 
 ---
 
-## 6. Group Management and Bulk Actions
+## 6. Agentic LinkedIn Lead Intake (Phase 1 MVP)
 
-### 6.1 Get All Groups
+All endpoints below are best-effort public-page collection only (no login required, no paid fallback source).
+
+### 6.1 Search Public Profiles
+**POST** `/api/agent/search-public-profiles`
+
+Builds company/sector-first public queries and returns candidate profile URLs with provenance.
+
+```json
+{
+  "companies": ["Target", "Shopify"],
+  "sectors": ["retail", "commerce"],
+  "titles": ["CEO", "COO", "CTO"],
+  "limit": 20,
+  "seedProfileUrls": ["https://www.linkedin.com/in/example/"]
+}
+```
+
+### 6.2 Extract Profile Signals
+**POST** `/api/agent/extract-profile-signals`
+
+Fetches public profile pages, extracts signals, and returns canonical candidates with confidence + provenance.
+
+```json
+{
+  "profiles": [
+    {
+      "profileUrl": "https://www.linkedin.com/in/example/",
+      "company": "Target",
+      "sector": "retail"
+    }
+  ]
+}
+```
+
+### 6.3 Rank C-Suite Targets
+**POST** `/api/agent/rank-csuite-targets`
+
+Ranks candidates and marks each as `accept` or `insufficient_public_data`.
+
+```json
+{
+  "minConfidence": 0.65,
+  "candidates": []
+}
+```
+
+### 6.4 Save Candidates
+**POST** `/api/agent/save-candidates`
+
+Persists only candidates above confidence threshold and rejects low-evidence records.
+
+```json
+{
+  "minConfidence": 0.65,
+  "candidates": []
+}
+```
+
+### Canonical Candidate Contract
+
+```json
+{
+  "identifier": "https://linkedin.com/in/example",
+  "name": "Jane Doe",
+  "title": "Chief Operating Officer",
+  "company": "Example Co",
+  "sector": "retail",
+  "isCSuite": true,
+  "confidence": 0.82,
+  "provenance": {
+    "sourceUrl": "https://www.linkedin.com/in/example/",
+    "fetchedAt": "2026-04-12T00:00:00.000Z",
+    "method": "public-profile-fetch"
+  },
+  "signals": {
+    "titleMatch": true,
+    "sectorMatch": true,
+    "companyMatch": true
+  }
+}
+```
+
+`POST /api/generate-email` now enforces a confidence guardrail for persisted agentic candidates and blocks generation when confidence is below threshold.
+
+---
+
+## 7. Group Management and Bulk Actions
+
+### 7.1 Get All Groups
 **GET** `/api/groups`
 Returns an array of all saved groups.
 
-### 6.2 Create a Group
+### 7.2 Create a Group
 **POST** `/api/groups`
 ```json
 {
@@ -261,7 +365,7 @@ Returns an array of all saved groups.
 }
 ```
 
-### 6.3 Update Contacts in a Group
+### 7.3 Update Contacts in a Group
 **PUT** `/api/groups/:id/contacts`
 Replace the entire list of contacts in a group.
 ```json
@@ -273,7 +377,7 @@ Replace the entire list of contacts in a group.
 }
 ```
 
-### 6.4 Add Contacts to a Group (Append)
+### 7.4 Add Contacts to a Group (Append)
 **POST** `/api/groups/:id/contacts`
 Appends new contacts to an existing group without deleting the old ones.
 ```json
@@ -284,11 +388,11 @@ Appends new contacts to an existing group without deleting the old ones.
 }
 ```
 
-### 6.5 Remove a Contact from a Group
+### 7.5 Remove a Contact from a Group
 **DELETE** `/api/groups/:id/contacts/:identifier`
 Removes a specific contact from the group by their exact `identifier`. (For emails and URLs, ensure the parameter is URL-encoded).
 
-### 6.6 Generate Bulk Emails
+### 7.6 Generate Bulk Emails
 **POST** `/api/bulk-generate-email`
 Generates a unique, high-quality email template specifically for your provided `context` (the campaign topic). The backend automatically handles replacing `{{Name}}` and `{{Company}}` locally for everyone in the group, ensuring you never hit AI rate limits.
 
@@ -317,7 +421,7 @@ You can supply a `groupId` to target a saved group, or an array of raw `identifi
 }
 ```
 
-### 6.7 Send Bulk Emails
+### 7.7 Send Bulk Emails
 **POST** `/api/bulk-send-email`
 Pass an array of emails to logically send them all concurrently.
 ```json

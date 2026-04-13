@@ -48,6 +48,17 @@ The Hono server exposes the following RESTful endpoints to coordinate with the f
 - **`GET /api/hubspot/contacts`**: Returns paginated HubSpot contacts (queries: `limit`, `offset`). Triggers the HubSpot API bridge if the requested offset requires more data than what currently exists in memory.
 - **`GET /api/hubspot/contacts/:count`**: Returns a designated count of contacts. Allows an `offset` query to bypass the first `n` contacts while supporting the auto-fetch bridge.
 
+### Agentic Lead Intake (Public-Page Only)
+- **`POST /api/agent/search-public-profiles`**: Builds sector/company-first public queries and discovers candidate profile URLs.
+- **`POST /api/agent/extract-profile-signals`**: Fetches public pages and extracts canonical lead fields, provenance, confidence, and ranking signals.
+- **`POST /api/agent/rank-csuite-targets`**: Scores candidates for C-suite targeting quality.
+- **`POST /api/agent/save-candidates`**: Persists only candidates above confidence threshold (guardrail applied).
+
+Operational characteristics:
+- Anonymous collection is best-effort and can be blocked (403/429) unpredictably.
+- Crawl attempts are persisted (success/failed/blocked/skipped) to enforce cooldown and avoid repeated dead-end fetches.
+- `src/linkedin.json` is used as bootstrap fallback, not primary source.
+
 Lead normalization details:
 - LinkedIn records are normalized at load time so `companyName` is mapped into `company`.
 - `companyWebsite` is preserved on each lead object for LinkedIn-related processing.
@@ -57,7 +68,7 @@ Lead normalization details:
 ### Processing & Action
 - **`POST /api/generate-email`**: 
   - **Payload:** `{ identifier: string, context: string }`
-  - **Action:** Looks up the lead incrementally (first in local leads, then in HubSpot contacts). Constructs the master prompt injecting the lead details and requests execution from the Gemini model.
+  - **Action:** Looks up validated persisted agentic candidates first. If confidence is below threshold, generation is blocked. Otherwise falls back to local leads and then HubSpot contacts. Constructs the master prompt injecting the lead details and requests execution from the Gemini model.
   - **Returns:** `{ success: boolean, text: string, leadName: string }`
 - **`POST /api/send-email`**: 
   - **Payload:** `{ to: string, subject: string, text: string }`
