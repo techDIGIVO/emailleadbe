@@ -43,7 +43,7 @@ export async function ensureHubspotContacts(requiredCount: number) {
       url.searchParams.append("properties", "hs_email_last_open_date")
       url.searchParams.append("properties", "hs_email_last_click_date")
       url.searchParams.append("properties", "industry")
-      url.searchParams.append("properties", "notes_last_activity_date")
+      url.searchParams.append("properties", "lastmodifieddate")
 
       if (hubspotCursor) {
         url.searchParams.set("after", hubspotCursor)
@@ -95,7 +95,7 @@ export async function ensureHubspotContacts(requiredCount: number) {
 
 const HUBSPOT_CONTACT_PROPERTIES = [
   'firstname', 'lastname', 'email', 'company', 'jobtitle',
-  'industry', 'notes_last_activity_date', 'hs_lead_status',
+  'industry', 'lastmodifieddate', 'hs_lead_status',
   'hs_email_last_open_date', 'hs_email_last_click_date',
   'state', 'city', 'country',
 ]
@@ -119,8 +119,15 @@ export async function fetchHubspotContactsDirect(options: {
   const limit = options.limit || 25
   const filters = options.filters || {}
 
-  // If filters are provided, use the Search API
-  if (Object.keys(filters).some(k => filters[k as keyof typeof filters] !== undefined)) {
+  // If filters are provided with actual values, use the Search API
+  // Check that at least one filter has a truthy, meaningful value
+  const hasActiveFilters = Object.entries(filters).some(([_k, v]) => {
+    if (v === undefined || v === null || v === '') return false
+    if (typeof v === 'number' && v <= 0) return false
+    return true
+  })
+
+  if (hasActiveFilters) {
     return fetchHubspotContactsWithFilters(ht, limit, options.after, filters)
   }
 
@@ -154,6 +161,12 @@ async function fetchHubspotContactsWithFilters(
   after: string | undefined,
   filters: NonNullable<Parameters<typeof fetchHubspotContactsDirect>[0]['filters']>
 ): Promise<{ contacts: any[], nextCursor: string | null }> {
+
+  // Build HubSpot Search API filter clauses
+  // Property types confirmed via /api/hubspot/diagnostics/properties:
+  //   company, jobtitle, industry, state, city, country → string/text → CONTAINS_TOKEN
+  //   hs_lead_status → enumeration → EQ
+  //   lastmodifieddate, hs_email_last_open_date → datetime → LT/GT, HAS_PROPERTY
   const filterClauses: any[] = []
 
   if (filters.company) {
@@ -174,12 +187,12 @@ async function fetchHubspotContactsWithFilters(
     filterClauses.push({ propertyName: 'hs_email_last_open_date', operator: 'NOT_HAS_PROPERTY' })
   }
   if (filters.lastUpdatedDays && filters.lastUpdatedDays > 0) {
-    const cutoff = new Date(Date.now() - filters.lastUpdatedDays * 24 * 60 * 60 * 1000).toISOString()
-    filterClauses.push({ propertyName: 'notes_last_activity_date', operator: 'LT', value: cutoff })
+    const cutoff = String(Date.now() - filters.lastUpdatedDays * 24 * 60 * 60 * 1000)
+    filterClauses.push({ propertyName: 'lastmodifieddate', operator: 'LT', value: cutoff })
   }
 
+  // Build filter groups — region needs OR across state/city/country
   let filterGroups: any[] = []
-
   if (filters.region) {
     filterGroups = [
       { filters: [...filterClauses, { propertyName: 'state', operator: 'CONTAINS_TOKEN', value: filters.region }] },
@@ -190,12 +203,21 @@ async function fetchHubspotContactsWithFilters(
     filterGroups = [{ filters: filterClauses }]
   }
 
+  // If no filters were built, fall back to List API
+  if (filterGroups.length === 0) {
+    console.log('[HubSpot] No filter clauses — using List API')
+    return fetchViaListAPI(token, limit, after)
+  }
+
+  // Try Search API first
   const searchBody: any = {
     limit,
     properties: HUBSPOT_CONTACT_PROPERTIES,
+    filterGroups,
   }
-  if (filterGroups.length > 0) searchBody.filterGroups = filterGroups
   if (after) searchBody.after = after
+
+  console.log('[HubSpot] Search API request:', JSON.stringify(searchBody, null, 2))
 
   const res = await fetch('https://api.hubapi.com/crm/v3/objects/contacts/search', {
     method: 'POST',
@@ -203,15 +225,122 @@ async function fetchHubspotContactsWithFilters(
     body: JSON.stringify(searchBody),
   })
 
+  if (res.ok) {
+    const data = await res.json()
+    console.log(`[HubSpot] Search API returned ${data.results?.length || 0} contacts`)
+    return {
+      contacts: data.results || [],
+      nextCursor: data.paging?.next?.after || null,
+    }
+  }
+
+  // Search API failed — fall back to List API + client-side filtering
+  const errText = await res.text()
+  console.warn(`[HubSpot] Search API returned ${res.status}, falling back to List API. Error: ${errText}`)
+  return fetchViaListAPIWithClientFilters(token, limit, after, filters)
+}
+
+// ---- Fallback: List API (no filters) ----
+
+async function fetchViaListAPI(
+  token: string, limit: number, after: string | undefined
+): Promise<{ contacts: any[], nextCursor: string | null }> {
+  const url = new URL('https://api.hubapi.com/crm/v3/objects/contacts')
+  url.searchParams.set('limit', String(limit))
+  for (const prop of HUBSPOT_CONTACT_PROPERTIES) {
+    url.searchParams.append('properties', prop)
+  }
+  if (after) url.searchParams.set('after', after)
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+  })
+
   if (!res.ok) {
     const errText = await res.text()
-    throw new Error(`HubSpot Search API returned ${res.status}: ${errText}`)
+    throw new Error(`HubSpot List API returned ${res.status}: ${errText}`)
   }
 
   const data = await res.json()
   return {
     contacts: data.results || [],
-    nextCursor: data.paging?.next?.after || null
+    nextCursor: data.paging?.next?.after || null,
+  }
+}
+
+// ---- Fallback: List API + client-side filtering ----
+
+async function fetchViaListAPIWithClientFilters(
+  token: string,
+  limit: number,
+  after: string | undefined,
+  filters: NonNullable<Parameters<typeof fetchHubspotContactsDirect>[0]['filters']>
+): Promise<{ contacts: any[], nextCursor: string | null }> {
+  const fetchSize = Math.min(limit * 10, 100)
+
+  const url = new URL('https://api.hubapi.com/crm/v3/objects/contacts')
+  url.searchParams.set('limit', String(fetchSize))
+  for (const prop of HUBSPOT_CONTACT_PROPERTIES) {
+    url.searchParams.append('properties', prop)
+  }
+  if (after) url.searchParams.set('after', after)
+
+  console.log(`[HubSpot] Fallback: fetching ${fetchSize} contacts via List API, filtering client-side`)
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+  })
+
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`HubSpot List API returned ${res.status}: ${errText}`)
+  }
+
+  const data = await res.json()
+  let contacts: any[] = data.results || []
+  const nextCursor = data.paging?.next?.after || null
+
+  contacts = contacts.filter((c: any) => {
+    const props = c.properties || {}
+
+    if (filters.company) {
+      if (!(props.company || '').toLowerCase().includes(filters.company.toLowerCase())) return false
+    }
+    if (filters.role) {
+      if (!(props.jobtitle || '').toLowerCase().includes(filters.role.toLowerCase())) return false
+    }
+    if (filters.industry) {
+      if (!(props.industry || '').toLowerCase().includes(filters.industry.toLowerCase())) return false
+    }
+    if (filters.leadStatus) {
+      if (props.hs_lead_status !== filters.leadStatus) return false
+    }
+    if (filters.interacted === true) {
+      if (!props.hs_email_last_open_date) return false
+    } else if (filters.interacted === false) {
+      if (props.hs_email_last_open_date) return false
+    }
+    if (filters.lastUpdatedDays && filters.lastUpdatedDays > 0) {
+      const cutoff = Date.now() - filters.lastUpdatedDays * 24 * 60 * 60 * 1000
+      const lastModified = props.lastmodifieddate ? new Date(props.lastmodifieddate).getTime() : 0
+      if (lastModified >= cutoff) return false
+    }
+    if (filters.region) {
+      const region = filters.region.toLowerCase()
+      const state = (props.state || '').toLowerCase()
+      const city = (props.city || '').toLowerCase()
+      const country = (props.country || '').toLowerCase()
+      if (!state.includes(region) && !city.includes(region) && !country.includes(region)) return false
+    }
+
+    return true
+  })
+
+  console.log(`[HubSpot] Fallback: ${data.results?.length || 0} fetched, ${contacts.length} matched filters`)
+
+  return {
+    contacts: contacts.slice(0, limit),
+    nextCursor,
   }
 }
 

@@ -172,10 +172,13 @@ export async function verifyContact(contact: any, batchId: string): Promise<any>
   let linkedinProfileUrl = hsLinkedinUrl
   let linkedinDiscoveryConfidence = hsLinkedinUrl ? 0.9 : 0
 
+  let geminiDiscoveryResult: Awaited<ReturnType<typeof findLinkedInForContact>> = null
+
   if (!linkedinProfileUrl) {
     // Use the Gemini agent to discover LinkedIn URL
     try {
       const result = await findLinkedInForContact(contact)
+      geminiDiscoveryResult = result
       if (result && result.profileUrl && result.confidence >= 0.4) {
         linkedinProfileUrl = result.profileUrl
         linkedinDiscoveryConfidence = result.confidence
@@ -185,7 +188,62 @@ export async function verifyContact(contact: any, batchId: string): Promise<any>
     }
   }
 
-  // If no LinkedIn profile found, return not_found
+  // If no LinkedIn URL found but Gemini found intel (company/title), use that for verification
+  if (!linkedinProfileUrl && geminiDiscoveryResult?.company) {
+    console.log(`[verify] ${fullName}: No LinkedIn URL but Gemini found intel — company="${geminiDiscoveryResult.company}" title="${geminiDiscoveryResult.title}"`)
+
+    const linkedinData = {
+      profileUrl: '',
+      name: geminiDiscoveryResult.name || fullName,
+      currentCompany: geminiDiscoveryResult.company,
+      currentTitle: geminiDiscoveryResult.title,
+      headline: '',
+      location: '',
+    }
+
+    // Skip to comparison using Gemini intel
+    let status: VerificationStatus = 'unverified'
+    const changes = {
+      previousCompany: hsCompany,
+      previousTitle: hsJobTitle,
+      newCompany: linkedinData.currentCompany,
+      newTitle: linkedinData.currentTitle,
+      companyChanged: false,
+      titleChanged: false,
+    }
+
+    const companyComparison = await compareFields('company', hsCompany, linkedinData.currentCompany)
+    const titleComparison = await compareFields('job title', hsJobTitle, linkedinData.currentTitle)
+
+    changes.companyChanged = !companyComparison.matches
+    changes.titleChanged = !titleComparison.matches
+
+    if (companyComparison.matches && titleComparison.matches) {
+      status = 'match'
+    } else if (!companyComparison.matches) {
+      status = 'stale'
+    } else {
+      status = 'discrepancy'
+    }
+
+    const { summary: aiSummary, confidence: aiConfidence } = await generateAiSummary(
+      hubspotData, linkedinData, status
+    )
+
+    const saved = await VerificationResult.findOneAndUpdate(
+      { hubspotContactId: contact.id, batchId },
+      {
+        hubspotContactId: contact.id, hubspotData, linkedinData, status, changes,
+        aiSummary, aiConfidence, batchId, verifiedAt: new Date(),
+      },
+      { upsert: true, new: true }
+    )
+
+    console.log(`[verify] ${fullName} @ ${hsCompany} → ${status} (Gemini intel: ${linkedinData.currentCompany} / ${linkedinData.currentTitle})`)
+    return saved
+  }
+
+  // If no LinkedIn profile found at all, return not_found
   if (!linkedinProfileUrl) {
     const notFoundResult = {
       hubspotContactId: contact.id,
@@ -207,7 +265,7 @@ export async function verifyContact(contact: any, batchId: string): Promise<any>
     return saved
   }
 
-  // Step 2: Fetch LinkedIn profile data
+  // Step 2: Fetch LinkedIn profile data, then enrich with Gemini discovery intel
   let linkedinData = {
     profileUrl: linkedinProfileUrl,
     name: '',
@@ -224,6 +282,35 @@ export async function verifyContact(contact: any, batchId: string): Promise<any>
     }
   } catch (err: any) {
     console.error(`[verify] LinkedIn fetch failed for ${fullName}:`, err.message)
+  }
+
+  // Enrich with Gemini discovery intel if the scraped data is missing or looks wrong
+  // (LinkedIn public pages often show "Location | Professional Profile" instead of real company,
+  //  or slug probing can match a different person with the same name)
+  if (geminiDiscoveryResult) {
+    const companyLooksBad = !linkedinData.currentCompany ||
+      linkedinData.currentCompany.toLowerCase().includes('professional profile') ||
+      linkedinData.currentCompany.toLowerCase().includes('united states') ||
+      linkedinData.currentCompany.toLowerCase().includes('linkedin')
+    const titleMissing = !linkedinData.currentTitle
+
+    // Also override when: Gemini found a company, the probe found a DIFFERENT company,
+    // and the probe company doesn't match HubSpot either — likely a different person with the same name
+    const probeCompanyConflictsWithGemini = geminiDiscoveryResult.company &&
+      linkedinData.currentCompany &&
+      !companyLooksBad &&
+      linkedinData.currentCompany.toLowerCase() !== geminiDiscoveryResult.company.toLowerCase() &&
+      linkedinData.currentCompany.toLowerCase() !== hsCompany.toLowerCase()
+
+    if ((companyLooksBad || probeCompanyConflictsWithGemini) && geminiDiscoveryResult.company) {
+      if (probeCompanyConflictsWithGemini) {
+        console.log(`[verify] Probe found "${linkedinData.currentCompany}" but Gemini says "${geminiDiscoveryResult.company}" — likely wrong person, using Gemini intel`)
+      }
+      linkedinData.currentCompany = geminiDiscoveryResult.company
+    }
+    if ((titleMissing || probeCompanyConflictsWithGemini) && geminiDiscoveryResult.title) {
+      linkedinData.currentTitle = geminiDiscoveryResult.title
+    }
   }
 
   // Step 3: Compare fields using AI
